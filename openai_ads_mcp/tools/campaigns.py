@@ -2,7 +2,7 @@
 
 Read tools: list_campaigns, get_campaign.
 Write tools: create_campaign, update_campaign, activate_campaign,
-pause_campaign, archive_campaign.
+pause_campaign, archive_campaign, duplicate_campaign.
 
 Safety defaults:
 - New campaigns are created with status "paused" unless explicitly set.
@@ -161,3 +161,85 @@ def archive_campaign(campaign_id: str) -> Any:
     See https://developers.openai.com/ads/api-reference/campaigns
     """
     return request("POST", f"/campaigns/{campaign_id}/archive")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+def duplicate_campaign(
+    source_campaign_id: str,
+    name: str,
+    lifetime_spend_limit_micros: int,
+    bidding_type: str = "conversions",
+    conversion_event_setting_ids: Optional[list[str]] = None,
+    max_bid_micros: Optional[int] = None,
+) -> Any:
+    """Duplicate a campaign with its ad groups and ads, all paused.
+
+    The source campaign's targeting, description, dates and conversion events
+    are copied. bidding_type defaults to conversions. A lifetime budget is
+    required because the Ads API does not create campaigns from daily budgets.
+    """
+    if lifetime_spend_limit_micros < _MIN_LIFETIME_SPEND_MICROS:
+        raise ValueError("lifetime_spend_limit_micros must be at least 1000000 (1 EUR).")
+    if bidding_type not in ("impressions", "clicks", "conversions"):
+        raise ValueError("bidding_type must be 'impressions', 'clicks', or 'conversions'.")
+
+    source = request("GET", f"/campaigns/{source_campaign_id}")
+    events = conversion_event_setting_ids
+    if events is None:
+        events = source.get("conversion_event_setting_ids") or []
+    if bidding_type == "conversions" and not events:
+        raise ValueError("Conversion campaigns require conversion_event_setting_ids.")
+
+    campaign_body = {
+        "name": name,
+        "description": source.get("description"),
+        "start_time": source.get("start_time"),
+        "end_time": source.get("end_time"),
+        "status": "paused",
+        "budget": {"lifetime_spend_limit_micros": lifetime_spend_limit_micros},
+        "bidding_type": bidding_type,
+        "conversion_event_setting_ids": events,
+        "targeting": source.get("targeting"),
+        "mode": source.get("mode"),
+    }
+    created_campaign = request("POST", "/campaigns", json_body=campaign_body)
+    new_campaign_id = created_campaign["id"]
+
+    copied_groups = []
+    copied_ads = []
+    groups = request("GET", "/ad_groups", params={"campaign_id": source_campaign_id})
+    for source_group in groups.get("data", []):
+        source_bid = (source_group.get("bidding_config") or {}).get("max_bid_micros")
+        bid = max_bid_micros if max_bid_micros is not None else source_bid
+        if bid is None:
+            raise ValueError(f"Source ad group {source_group.get('id')} has no max_bid_micros.")
+        billing_event = "click" if bidding_type == "conversions" else (source_group.get("bidding_config") or {}).get("billing_event_type", "impression")
+        new_group = request("POST", "/ad_groups", json_body={
+            "campaign_id": new_campaign_id,
+            "name": source_group.get("name"),
+            "description": source_group.get("description"),
+            "context_hints": source_group.get("context_hints"),
+            "status": "paused",
+            "bidding_config": {"billing_event_type": billing_event, "max_bid_micros": bid},
+        })
+        copied_groups.append(new_group)
+
+        ads = request("GET", "/ads", params={"ad_group_id": source_group["id"]})
+        for source_ad in ads.get("data", []):
+            creative = source_ad.get("creative")
+            if not creative:
+                raise ValueError(f"Source ad {source_ad.get('id')} has no creative data.")
+            new_ad = request("POST", "/ads", json_body={
+                "ad_group_id": new_group["id"],
+                "name": source_ad.get("name"),
+                "status": "paused",
+                "creative": creative,
+            })
+            copied_ads.append(new_ad)
+
+    return {
+        "campaign": created_campaign,
+        "ad_groups": copied_groups,
+        "ads": copied_ads,
+        "status": "paused",
+    }
